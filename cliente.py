@@ -217,8 +217,11 @@ class ClientApp:
                 self.q.put(("status", f"Conectado a {self.host}", "green"))
                 self.report(r)
             elif t == "shutdown":
-                self.report((True, "Apagando en 10 segundos"))
-                shutdown_pc()
+                ok, result = shutdown_pc()
+                if ok:
+                    self.report((True, result or "Apagado programado"))
+                else:
+                    self.report((False, result))
             elif t == "block_sites":
                 self.report(block_sites(h.get("sites", [])))
             elif t == "unblock_sites":

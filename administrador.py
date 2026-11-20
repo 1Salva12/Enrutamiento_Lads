@@ -398,15 +398,15 @@ class AdminApp:
         threading.Thread(target=work, daemon=True).start()
 
     def shutdown(self):
-        if messagebox.askyesno("Confirmar", "¿Apagar los equipos seleccionados?"):
-            self.cmd({"type": "shutdown"})
+        if messagebox.askyesno("Confirmar", "¿Apagar Cliente 1 y Cliente 2?"):
+            self.cmd_all_clients({"type": "shutdown"})
 
     def block_sites(self):
         sites = [s.strip() for s in self.sites.get().split(",") if s.strip()]
         if not sites:
             messagebox.showinfo("Aviso", "Escribe al menos un sitio web")
             return
-        self.cmd({"type": "block_sites", "sites": sites})
+        self.cmd_all_clients({"type": "block_sites", "sites": sites})
 
     def block_sites_all(self):
         sites = [s.strip() for s in self.sites.get().split(",") if s.strip()]
@@ -417,7 +417,7 @@ class AdminApp:
 
     def unblock_sites_selected(self):
         sites = [s.strip() for s in self.sites.get().split(",") if s.strip()]
-        self.cmd({"type": "unblock_sites", "sites": sites})
+        self.cmd_all_clients({"type": "unblock_sites", "sites": sites})
 
     def unblock_sites_all(self):
         sites = [s.strip() for s in self.sites.get().split(",") if s.strip()]
