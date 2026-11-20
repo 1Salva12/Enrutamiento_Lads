@@ -23,10 +23,8 @@ class ClientApp:
         self.q = queue.Queue()
         self.streaming = False
         self.viewer = None
+        self.peer_viewers = {}
         self.locked = False
-        self.remote_viewing = False
-        self.remote_viewer = None
-        self.remote_view_button = None
         for w in root.winfo_children():
             w.destroy()
         setup_theme(root)
@@ -54,14 +52,6 @@ class ClientApp:
                   style="Card.TLabel", font=("Segoe UI", 10, "bold")).pack(anchor="w")
         ttk.Label(notice, text="Cierra esta ventana para desconectarte.",
                   style="Muted.TLabel").pack(anchor="w", pady=(3, 0))
-        if self.client_index == 1:
-            view_row = ttk.Frame(body)
-            view_row.pack(fill="x", pady=(0, 12))
-            self.remote_view_button = ttk.Button(
-                view_row, text="Ver pantalla del Cliente 2",
-                command=self.toggle_client2_view, state="disabled",
-            )
-            self.remote_view_button.pack(side="left")
 
         chat_card = ttk.Frame(body, style="Card.TFrame", padding=12)
         chat_card.pack(fill="both", expand=True)
@@ -75,9 +65,18 @@ class ClientApp:
         self.entry = ttk.Entry(row)
         self.entry.pack(side="left", fill="x", expand=True, ipady=2)
         self.entry.bind("<Return>", lambda e: self.send_chat())
-        ttk.Button(row, text="Enviar archivo", command=self.send_file).pack(side="right", padx=(8, 0))
         ttk.Button(row, text="Enviar", command=self.send_chat,
                    style="Primary.TButton").pack(side="right")
+        file_row = ttk.Frame(row, style="Card.TFrame")
+        file_row.pack(side="right", padx=(8, 0))
+        ttk.Label(file_row, text="Destinatario:", style="Card.TLabel").pack(side="left")
+        self.file_recipient = tk.StringVar(value="Administrador")
+        ttk.Combobox(
+            file_row, textvariable=self.file_recipient,
+            values=("Administrador", "Cliente 1", "Cliente 2"),
+            state="readonly", width=13,
+        ).pack(side="left", padx=4)
+        ttk.Button(file_row, text="Archivo", command=self.send_file).pack(side="left")
         root.protocol("WM_DELETE_WINDOW", self.quit)
         threading.Thread(target=self.connect_loop, daemon=True).start()
         self.poll()
@@ -97,34 +96,28 @@ class ClientApp:
                     self.log(args[0])
                 elif kind == "status":
                     self.status.configure(text=args[0], foreground=args[1])
-                    if self.remote_view_button:
-                        connected = (
-                            args[0].startswith("Conectado")
-                            or args[0].startswith("Teclado/mouse BLOQUEADOS")
-                        )
-                        self.remote_view_button.configure(
-                            state="normal" if connected else "disabled"
-                        )
-                        if not connected and self.remote_viewing:
-                            self.stop_client2_view()
                 elif kind == "admin_frame":
                     if not self.viewer or not self.viewer.alive:
                         self.viewer = Viewer(self.root, "Pantalla del administrador")
                     self.viewer.show(args[0])
-                elif kind == "client2_frame":
-                    if not self.remote_viewer or not self.remote_viewer.alive:
-                        self.remote_viewer = Viewer(
-                            self.root, "Pantalla del Cliente 2",
-                            on_close=self.stop_client2_view,
-                        )
-                    self.remote_viewer.show(args[0])
-                elif kind == "view_client2_error":
-                    self.remote_viewing = False
-                    if self.remote_view_button:
-                        self.remote_view_button.configure(
-                            text="Ver pantalla del Cliente 2"
-                        )
-                    self.log("[Vista no disponible] " + args[0])
+                elif kind == "client_screen_start":
+                    source_index, sender = args
+                    viewer = self.peer_viewers.get(source_index)
+                    if not viewer or not viewer.alive:
+                        viewer = Viewer(self.root, f"Pantalla de {sender}")
+                        self.peer_viewers[source_index] = viewer
+                    self.log(f"[El administrador compartió la pantalla de {sender}]")
+                elif kind == "client_screen_frame":
+                    source_index, data = args
+                    viewer = self.peer_viewers.get(source_index)
+                    if viewer and viewer.alive:
+                        viewer.show(data)
+                elif kind == "client_screen_stop":
+                    source_index, sender = args
+                    viewer = self.peer_viewers.pop(source_index, None)
+                    if viewer and viewer.alive:
+                        viewer.close()
+                    self.log(f"[Se detuvo la pantalla compartida de {sender}]")
                 elif kind == "admin_stop":
                     if self.viewer:
                         self.viewer.close()
@@ -133,7 +126,6 @@ class ClientApp:
         self.root.after(80, self.poll)
 
     def quit(self):
-        self.stop_client2_view()
         self.streaming = False
         set_input_lock(False)
         if self.conn:
@@ -190,17 +182,42 @@ class ClientApp:
             if t == "chat":
                 sender = h.get("sender", "Administrador")
                 self.q.put(("chat", f"{sender}: {h.get('text', '')}"))
-            elif t == "view_client2_started":
-                self.q.put(("chat", "[Mostrando pantalla del Cliente 2]"))
-            elif t == "view_client2_error":
-                self.q.put(("view_client2_error", h.get("text", "No se pudo abrir la vista")))
-            elif t == "client2_frame":
-                self.q.put(("client2_frame", p))
+            elif t == "client_screen_start":
+                source_index = h.get("source_index")
+                if type(source_index) is int and source_index in (1, 2):
+                    self.q.put((
+                        "client_screen_start",
+                        source_index,
+                        h.get("sender", f"Cliente {source_index}"),
+                    ))
+            elif t == "client_screen_frame":
+                source_index = h.get("source_index")
+                if type(source_index) is int and source_index in (1, 2):
+                    self.q.put(("client_screen_frame", source_index, p))
+            elif t == "client_screen_stop":
+                source_index = h.get("source_index")
+                if type(source_index) is int and source_index in (1, 2):
+                    self.q.put((
+                        "client_screen_stop",
+                        source_index,
+                        h.get("sender", f"Cliente {source_index}"),
+                    ))
             elif t == "file":
-                folder = received_dir_for_client(h.get("client_index"))
-                path = save_received(folder, h.get("name", "archivo"), p)
-                self.q.put(("chat", f"[Archivo recibido] {path}"))
-                self.report((True, f"Archivo guardado en {path}"))
+                sender = h.get("sender", "Administrador")
+                try:
+                    folder = received_dir_for_client(
+                        h.get("client_index", self.client_index)
+                    )
+                    path = save_received(folder, h.get("name", "archivo"), p)
+                except Exception as exc:
+                    self.q.put(("chat", f"[Error recibiendo archivo de {sender}] {exc}"))
+                    self.report((False, f"Error guardando archivo: {exc}"))
+                else:
+                    self.q.put(("chat", f"[Archivo recibido de {sender}] {path}"))
+                    self.report((True, f"Archivo guardado en {path}"))
+            elif t == "file_status":
+                prefix = "✔" if h.get("ok") else "✘"
+                self.q.put(("chat", f"[{prefix} {h.get('text', 'Estado de envío desconocido')}]"))
             elif t == "screen_start" and not self.streaming:
                 self.streaming = True
                 threading.Thread(target=self.stream, daemon=True).start()
@@ -254,44 +271,34 @@ class ClientApp:
             except Exception:
                 self.log("[Sin conexión]")
 
-    def toggle_client2_view(self):
-        if self.remote_viewing:
-            self.stop_client2_view()
-            return
-        if not self.conn:
+    def send_file(self):
+        conn = self.conn
+        if not conn:
             self.log("[Sin conexión al administrador]")
             return
-        try:
-            self.conn.send({"type": "view_client2_start"})
-            self.remote_viewing = True
-            self.remote_view_button.configure(text="Dejar de ver Cliente 2")
-        except Exception as exc:
-            self.log(f"[Error solicitando pantalla de Cliente 2] {exc}")
-
-    def stop_client2_view(self):
-        if self.remote_viewing and self.conn:
-            try:
-                self.conn.send({"type": "view_client2_stop"})
-            except Exception:
-                pass
-        self.remote_viewing = False
-        if self.remote_view_button:
-            self.remote_view_button.configure(text="Ver pantalla del Cliente 2")
-        if self.remote_viewer and self.remote_viewer.alive:
-            viewer, self.remote_viewer = self.remote_viewer, None
-            viewer.on_close = None
-            viewer.close()
-
-    def send_file(self):
-        path = filedialog.askopenfilename()
-        if not path or not self.conn:
+        recipient = self.file_recipient.get()
+        recipient_id = {
+            "Administrador": "admin",
+            "Cliente 1": 1,
+            "Cliente 2": 2,
+        }.get(recipient)
+        if recipient_id is None:
+            self.log("[Selecciona un destinatario válido]")
+            return
+        path = filedialog.askopenfilename(title=f"Selecciona archivo para {recipient}")
+        if not path:
             return
 
         def work():
             try:
                 with open(path, "rb") as f:
-                    self.conn.send({"type": "file", "name": os.path.basename(path)}, f.read())
-                self.q.put(("chat", f"[Archivo enviado] {os.path.basename(path)}"))
+                    data = f.read()
+                conn.send({
+                    "type": "file_send",
+                    "recipient": recipient_id,
+                    "name": os.path.basename(path),
+                }, data)
+                self.q.put(("chat", f"[Enviando archivo a {recipient}] {os.path.basename(path)}"))
             except Exception as e:
-                self.q.put(("chat", f"[Error enviando archivo] {e}"))
+                self.q.put(("chat", f"[Error enviando archivo a {recipient}] {e}"))
         threading.Thread(target=work, daemon=True).start()

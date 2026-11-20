@@ -30,6 +30,8 @@ class AdminApp:
         self.peers_lock = threading.Lock()
         self.screen_lock = threading.Lock()
         self.screen_watchers = {}
+        self.client_shares = {}
+        self.client_shares_lock = threading.Lock()
         self.q = queue.Queue()
         self.viewer = None
         self.view_peer = None
@@ -117,10 +119,27 @@ class AdminApp:
 
         rmm_button("Ver Cliente 1 y Cliente 2", self.view_all)
         rmm_button("Detener vista", self.stop_dual_view)
+        rmm_button(
+            "Compartir Cliente 2 → Cliente 1",
+            lambda: self.start_client_sharing(2, 1),
+        )
+        rmm_button(
+            "Compartir Cliente 1 → Cliente 2",
+            lambda: self.start_client_sharing(1, 2),
+        )
+        rmm_button("Detener compartir entre clientes", self.stop_client_sharing, "#596B7D")
         rmm_button("Compartir pantalla del servidor", self.start_share)
         rmm_button("Dejar de transmitir pantalla del admin", self.stop_share, "#596B7D")
         rmm_button("Abrir ventana de chat", self.open_chat)
-        rmm_button("Enviar archivo al cliente", self.send_file)
+        tk.Label(command_panel, text="Enviar archivo a:", bg="#0B2A5B", fg="#FFFFFF",
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=22, pady=(8, 2))
+        self.file_recipient = tk.StringVar(value="Cliente 1")
+        ttk.Combobox(
+            command_panel, textvariable=self.file_recipient,
+            values=("Administrador", "Cliente 1", "Cliente 2"),
+            state="readonly",
+        ).pack(fill="x", padx=22, pady=(0, 4))
+        rmm_button("Elegir y enviar archivo", self.send_file)
         rmm_button("6. Bloquear Teclado/Mouse", lambda: self.cmd({"type": "lock"}), "#E6A21A")
         rmm_button("7. Desbloquear Teclado/Mouse", lambda: self.cmd({"type": "unlock"}), "#12AFA8")
         rmm_button("8. Apagar PC Remotamente", self.shutdown, "#E43C46")
@@ -331,6 +350,7 @@ class AdminApp:
     def quit(self):
         self.sharing = False
         self.stop_dual_view()
+        self.stop_client_sharing()
         self.close_chat()
         self.root.destroy()
 
@@ -377,24 +397,46 @@ class AdminApp:
                 self.q.put(("log", f"[Error enviando mensaje a Cliente {peer.client_index}] {exc}"))
 
     def send_file(self):
-        path = filedialog.askopenfilename()
+        recipient = self.file_recipient.get()
+        target = None
+        if recipient in ("Cliente 1", "Cliente 2"):
+            client_index = int(recipient.split()[-1])
+            target = next(
+                (peer for peer in self.ordered_peers()
+                 if peer.client_index == client_index),
+                None,
+            )
+            if target is None:
+                messagebox.showinfo("Aviso", f"{recipient} no está conectado")
+                return
+
+        path = filedialog.askopenfilename(title=f"Selecciona archivo para {recipient}")
         if not path:
             return
-        ts = self.targets()
 
         def work():
-            with open(path, "rb") as f:
-                data = f.read()
-            for p in ts:
-                try:
-                    p.conn.send({
-                        "type": "file",
-                        "name": os.path.basename(path),
-                        "client_index": p.client_index,
-                    }, data)
-                    self.q.put(("log", f"[Archivo enviado a {p.name}] {os.path.basename(path)}"))
-                except Exception as e:
-                    self.q.put(("log", f"[Error con {p.name}] {e}"))
+            name = os.path.basename(path)
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+                if recipient == "Administrador":
+                    saved_path = save_received(
+                        os.path.join(RECV_DIR, "Administrador"), name, data
+                    )
+                    self.q.put(("log", f"[Archivo guardado para el administrador] {saved_path}"))
+                    return
+                if target is None:
+                    self.q.put(("log", f"[Destinatario no disponible] {recipient}"))
+                    return
+                target.conn.send({
+                    "type": "file",
+                    "name": name,
+                    "client_index": target.client_index,
+                    "sender": "Administrador",
+                }, data)
+                self.q.put(("log", f"[Archivo enviado a {recipient}] {name}"))
+            except Exception as exc:
+                self.q.put(("log", f"[Error enviando archivo a {recipient}] {exc}"))
         threading.Thread(target=work, daemon=True).start()
 
     def shutdown(self):
@@ -550,20 +592,116 @@ class AdminApp:
                 target.conn.send({"type": "screen_stop"})
         except Exception as exc:
             self.q.put(("log", f"[Error controlando pantalla de Cliente {target.client_index}] {exc}"))
+            with self.screen_lock:
+                watchers = self.screen_watchers.get(target)
+                if watchers:
+                    watchers.discard(watcher)
+                    if not watchers:
+                        self.screen_watchers.pop(target, None)
+            return False
+        return True
+
+    def start_client_sharing(self, source_index, recipient_index):
+        peers_by_id = {peer.client_index: peer for peer in self.ordered_peers()}
+        source = peers_by_id.get(source_index)
+        recipient = peers_by_id.get(recipient_index)
+        if source is None or recipient is None:
+            messagebox.showinfo(
+                "Aviso",
+                "Cliente 1 y Cliente 2 deben estar conectados para compartir pantalla",
+            )
+            return
+
+        key = (source_index, recipient_index)
+        with self.client_shares_lock:
+            if key in self.client_shares:
+                return
+
+        try:
+            recipient.conn.send({
+                "type": "client_screen_start",
+                "source_index": source_index,
+                "sender": f"Cliente {source_index} ({source.name})",
+            })
+        except Exception as exc:
+            self.q.put(("log", f"[No se pudo avisar a Cliente {recipient_index}] {exc}"))
+            return
+
+        if not self.watch_screen(source, recipient, True):
+            try:
+                recipient.conn.send({
+                    "type": "client_screen_stop",
+                    "source_index": source_index,
+                    "sender": f"Cliente {source_index}",
+                })
+            except Exception:
+                pass
+            return
+        with self.client_shares_lock:
+            self.client_shares[key] = (source, recipient)
+        self.q.put((
+            "log",
+            f"[Compartiendo Cliente {source_index} → Cliente {recipient_index}]",
+        ))
+
+    def stop_client_sharing(self):
+        with self.client_shares_lock:
+            shares = list(self.client_shares.items())
+            self.client_shares.clear()
+        for (source_index, recipient_index), (source, recipient) in shares:
+            try:
+                recipient.conn.send({
+                    "type": "client_screen_stop",
+                    "source_index": source_index,
+                    "sender": f"Cliente {source_index}",
+                })
+            except Exception as exc:
+                self.q.put((
+                    "log",
+                    f"[No se pudo notificar a Cliente {recipient_index}] {exc}",
+                ))
+            self.watch_screen(source, recipient, False)
+        if shares:
+            self.q.put(("log", "[Se detuvo el compartir pantalla entre clientes]"))
+
+    def remove_client_shares_for_peer(self, peer):
+        with self.client_shares_lock:
+            lost_shares = [
+                (key, pair) for key, pair in self.client_shares.items()
+                if peer in pair
+            ]
+            for key, _ in lost_shares:
+                self.client_shares.pop(key, None)
+        for (source_index, recipient_index), (source, recipient) in lost_shares:
+            if source is peer and recipient is not peer:
+                try:
+                    recipient.conn.send({
+                        "type": "client_screen_stop",
+                        "source_index": source_index,
+                        "sender": f"Cliente {source_index}",
+                    })
+                except Exception:
+                    pass
+            self.q.put((
+                "log",
+                f"[Compartir Cliente {source_index} → Cliente {recipient_index} detenido por desconexión]",
+            ))
 
     def remove_screen_watches(self, peer):
         with self.screen_lock:
             watchers = self.screen_watchers.pop(peer, set())
         for watcher in watchers:
-            if isinstance(watcher, Peer) and watcher.client_index == 1:
+            if isinstance(watcher, Peer):
                 try:
                     watcher.conn.send({
-                        "type": "view_client2_error",
-                        "text": "Cliente 2 se desconectó",
+                        "type": "client_screen_stop",
+                        "source_index": peer.client_index,
+                        "sender": f"Cliente {peer.client_index}",
                     })
                 except Exception:
                     pass
         self.remove_screen_watcher(peer)
+        self.remove_client_shares_for_peer(peer)
 
     def remove_screen_watcher(self, watcher):
         stop_targets = []
@@ -685,36 +823,86 @@ class AdminApp:
                         {"type": "chat", "sender": sender, "text": text},
                         exclude=peer,
                     )
-                elif t == "view_client2_start":
-                    if peer.client_index != 1:
-                        conn.send({"type": "view_client2_error",
-                                   "text": "Solo Cliente 1 puede solicitar esta vista"})
-                        continue
-                    target = next(
-                        (candidate for candidate in self.ordered_peers()
-                         if candidate.client_index == 2),
-                        None,
-                    )
-                    if target is None:
-                        conn.send({"type": "view_client2_error",
-                                   "text": "Cliente 2 no está conectado"})
-                        continue
-                    self.watch_screen(target, peer, True)
-                    conn.send({"type": "view_client2_started"})
-                    self.q.put(("log", "[Cliente 1 solicitó ver la pantalla de Cliente 2]"))
-                elif t == "view_client2_stop":
-                    self.remove_screen_watcher(peer)
-                    self.q.put(("log", "[Cliente 1 dejó de ver Cliente 2]"))
                 elif t == "frame":
                     self.q.put(("frame", peer, payload))
                     with self.screen_lock:
                         viewers = tuple(self.screen_watchers.get(peer, ()))
                     for viewer in viewers:
-                        if isinstance(viewer, Peer) and viewer.client_index == 1:
+                        if isinstance(viewer, Peer):
                             try:
-                                viewer.conn.send({"type": "client2_frame"}, payload)
+                                viewer.conn.send({
+                                    "type": "client_screen_frame",
+                                    "source_index": peer.client_index,
+                                }, payload)
                             except Exception as exc:
-                                self.q.put(("log", f"[Error retransmitiendo pantalla a Cliente 1] {exc}"))
+                                self.q.put((
+                                    "log",
+                                    f"[Error retransmitiendo pantalla de Cliente {peer.client_index} "
+                                    f"a Cliente {viewer.client_index}] {exc}",
+                                ))
+                elif t == "file_send":
+                    recipient = hd.get("recipient")
+                    name = os.path.basename(str(hd.get("name") or "archivo")) or "archivo"
+                    if recipient == "admin":
+                        try:
+                            folder = os.path.join(
+                                RECV_DIR,
+                                f"Cliente {peer.client_index} - {os.path.basename(peer.name)}",
+                            )
+                            path = save_received(folder, name, payload)
+                            conn.send({
+                                "type": "file_status",
+                                "ok": True,
+                                "text": f"Archivo recibido por el administrador: {path}",
+                            })
+                            self.q.put(("log", f"[Archivo de {peer.name}] guardado en {path}"))
+                        except Exception as exc:
+                            conn.send({
+                                "type": "file_status",
+                                "ok": False,
+                                "text": f"No se pudo guardar en el administrador: {exc}",
+                            })
+                    elif type(recipient) is int and recipient in (1, 2):
+                        target = next(
+                            (candidate for candidate in self.ordered_peers()
+                             if candidate.client_index == recipient),
+                            None,
+                        )
+                        if target is None:
+                            conn.send({
+                                "type": "file_status",
+                                "ok": False,
+                                "text": f"Cliente {recipient} no está conectado",
+                            })
+                            continue
+                        try:
+                            target.conn.send({
+                                "type": "file",
+                                "name": name,
+                                "client_index": target.client_index,
+                                "sender": f"Cliente {peer.client_index} ({peer.name})",
+                            }, payload)
+                            conn.send({
+                                "type": "file_status",
+                                "ok": True,
+                                "text": f"Archivo enviado a Cliente {recipient}",
+                            })
+                            self.q.put((
+                                "log",
+                                f"[Archivo de Cliente {peer.client_index} enviado a Cliente {recipient}] {name}",
+                            ))
+                        except Exception as exc:
+                            conn.send({
+                                "type": "file_status",
+                                "ok": False,
+                                "text": f"No se pudo enviar a Cliente {recipient}: {exc}",
+                            })
+                    else:
+                        conn.send({
+                            "type": "file_status",
+                            "ok": False,
+                            "text": "Destinatario de archivo no válido",
+                        })
                 elif t == "file":
                     path = save_received(os.path.join(RECV_DIR, peer.name), hd.get("name", "archivo"), payload)
                     self.q.put(("log", f"[Archivo de {peer.name}] guardado en {path}"))

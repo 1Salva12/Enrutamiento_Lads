@@ -28,9 +28,7 @@ HERE_MSG = b"LABCONTROL_HERE"
 
 IS_WIN = platform.system() == "Windows"
 
-RECV_DIR = r"C:\Users\Salva\Documents\Semestre_7\DESARROLLO DE APLICACIONES PARA DISPOSITIVOS MÓVILES\Nueva carpeta"
-
-CLIENT1_RECV_DIR = r"C:\Users\salva\OneDrive\Documents\Recibidos del cliente 1"
+RECV_DIR = os.path.join(os.path.expanduser("~"), "Downloads", "Lab Control")
 
 HOSTS = (r"C:\Windows\System32\drivers\etc\hosts" if IS_WIN else "/etc/hosts")
 
@@ -156,11 +154,9 @@ def save_received(folder, name, data):
     return path
 
 def received_dir_for_client(client_index):
-    if client_index == 1:
-        return CLIENT1_RECV_DIR
-    if client_index == 2:
-        return os.path.join(os.path.expanduser("~"), "Downloads")
-    return RECV_DIR
+    if client_index in (1, 2):
+        return os.path.join(RECV_DIR, f"Cliente {client_index}")
+    return os.path.join(RECV_DIR, "Administrador")
 
 def run(cmd):
     try:
